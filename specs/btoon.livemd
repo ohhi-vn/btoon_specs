@@ -1,0 +1,825 @@
+# BTOON — Binary TOON · Executable Spec Walkthrough
+
+## Section
+
+An executable companion to the [BTOON specification](btoon.md). BTOON is a
+compact, deterministic, high-performance **binary encoding of the TOON data
+model** — the relationship BSON has to JSON. The TOON text side of the model is
+implemented by the [`toon_ex`](https://hex.pm/packages/toon_ex) Elixir package
+([docs](https://toon-ex.hexdocs.pm/)); this notebook implements the BTOON
+binary side from scratch, in plain Elixir, with **zero dependencies**.
+
+You will:
+
+* build a minimal spec-conformant codec — envelope, SmallInt, string table,
+  TypedArray, ObjectTable, schema mode, alignment padding;
+* verify it byte-for-byte against every test vector in
+  [§26](btoon.md#26-test-vectors) of the spec;
+* watch alignment padding and determinism rules do their job on real bytes.
+
+## 1. A minimal spec-conformant codec
+
+One cell, one module. It implements the spec's cold and hot paths:
+
+| Spec section | What the codec does                                                   |
+| ------------ | --------------------------------------------------------------------- |
+| §7          | envelope: magic `"BTON"`, version, flags, reserved                    |
+| §8–§9    | SmallInt (−32..95), Int32/Int64, Float32/Float64, strings, binaries |
+| §10–§11  | arrays, objects (sorted keys), per-message string table               |
+| §13, §16   | TypedArray with element-size alignment padding                        |
+| §14         | ObjectTable (column mode)                                             |
+| §7.6, §15  | schema mode with embedded authoritative schema, padded block          |
+| §19         | trailing-byte rejection, flag/body consistency                        |
+
+Out of scope for the walkthrough: session dictionary (flags 0x08/0x10),
+extension types (§23), change tracking (§20).
+
+```elixir
+defmodule BTOON.Example do
+  @moduledoc """
+  Minimal BTOON (Binary TOON) codec for the Livebook walkthrough.
+
+  Implements the spec end to end:
+
+  * envelope: magic "BTON", version 1, flags, reserved (§7)
+  * per-message string table, flag 0x04, first-encounter order, 8-byte pad (§7.5, §11)
+  * SmallInt −32..95, Int32/Int64, Float32/Float64 (§8, §9)
+  * StringRef, arrays, objects with sorted keys (§9, §10, §17)
+  * TypedArray tag 0x0C with element-size alignment padding (§13, §16)
+  * ObjectTable tag 0x0D, columnar numeric tables (§14)
+  * schema mode, flag 0x02, embedded authoritative schema, padded block (§7.6, §15)
+  * schema ID as UInt16, flag 0x20 (§7.6.1)
+  * trailing-byte rejection and flag/body consistency (§19)
+
+  Out of scope for the walkthrough: session dictionary (flags 0x08/0x10),
+  extension types (§23), change tracking (§20).
+  """
+
+  @magic "BTON"
+
+  defmodule Raw do
+    @enforce_keys [:bytes]
+    defstruct [:bytes]
+  end
+
+  defmodule TypedArray do
+    @enforce_keys [:element_type, :values]
+    defstruct [:element_type, :values]
+  end
+
+  defmodule ObjectTable do
+    @enforce_keys [:columns]
+    defstruct [:columns]
+  end
+
+  @elem_types %{
+    int8: {0x00, 1}, uint8: {0x01, 1},
+    int16: {0x02, 2}, uint16: {0x03, 2},
+    int32: {0x04, 4}, uint32: {0x05, 4},
+    int64: {0x06, 8}, uint64: {0x0F, 8},
+    float32: {0x07, 4}, float64: {0x08, 8},
+    null: {0x09, 0}, bool: {0x0A, 1},
+    string: {0x0B, 0}, binary: {0x0C, 0},
+    array: {0x0D, 0}, object: {0x0E, 0}
+  }
+
+  @int_order [:int8, :uint8, :int16, :uint16, :int32, :uint32, :int64, :uint64]
+  @sel_to_type Map.new(@elem_types, fn {t, {sel, _}} -> {sel, t} end)
+
+  import Bitwise
+
+  ## ── Encode ──────────────────────────────────────────────────────────────
+
+  def encode(data, opts \\ []) do
+    schema = Keyword.get(opts, :schema)
+    id16? = Keyword.get(opts, :schema_id_uint16, false)
+    table_mode = Keyword.get(opts, :string_table, :auto) == :auto
+
+    strings =
+      if schema do
+        Enum.flat_map(schema.fields, fn {name, _t} -> collect(Map.fetch!(data, name)) end)
+      else
+        collect(data)
+      end
+      |> Enum.uniq()
+
+    table? = table_mode and strings != []
+    refs = if table?, do: Map.new(Enum.with_index(strings)), else: %{}
+
+    flags =
+      0
+      |> maybe_flag(table?, 0x04)
+      |> maybe_flag(schema != nil, 0x02)
+      |> maybe_flag(id16? and schema != nil, 0x20)
+
+    {table_iodata, table_size} =
+      if table? do
+        content =
+          IO.iodata_to_binary([
+            <<length(strings)::32-little>>,
+            Enum.map(strings, &[<<byte_size(&1)::32-little>>, &1])
+          ])
+
+        pad_to_8(content)
+      else
+        {[], 0}
+      end
+
+    {schema_iodata, schema_size} =
+      if schema, do: pad_to_8(IO.iodata_to_binary(schema_block(schema, id16?))), else: {[], 0}
+
+    base = 8 + table_size + schema_size
+
+    {body, _off} =
+      if schema, do: enc_schema_body(data, schema, refs, id16?, base), else: enc(data, refs, opts, base)
+
+    IO.iodata_to_binary([@magic, <<1>>, <<flags>>, <<0, 0>>, table_iodata, schema_iodata, body])
+  end
+
+  defp maybe_flag(acc, true, bit), do: acc + bit
+  defp maybe_flag(acc, false, _bit), do: acc
+
+  defp pad_to_8(content) do
+    pad = rem(8 - rem(byte_size(content), 8), 8)
+    {[content, :binary.copy(<<0>>, pad)], byte_size(content) + pad}
+  end
+
+  defp enc(nil, _refs, _opts, off), do: {<<0x00>>, off + 1}
+  defp enc(false, _refs, _opts, off), do: {<<0x01>>, off + 1}
+  defp enc(true, _refs, _opts, off), do: {<<0x02>>, off + 1}
+
+  defp enc(n, _refs, _opts, off) when is_integer(n) and n in -32..95, do: {<<n + 64>>, off + 1}
+
+  defp enc(n, _refs, _opts, off) when is_integer(n) and n in -2_147_483_648..2_147_483_647,
+    do: {<<0x03, n::signed-little-size(32)>>, off + 5}
+
+  defp enc(n, _refs, _opts, off) when is_integer(n), do: {<<0x04, n::signed-little-size(64)>>, off + 9}
+
+  defp enc(f, _refs, _opts, off) when is_float(f) do
+    if float32_lossless?(f) do
+      {<<0x05, f::float-little-size(32)>>, off + 5}
+    else
+      {<<0x06, f::float-little-size(64)>>, off + 9}
+    end
+  end
+
+  defp enc(%Raw{bytes: b}, _refs, _opts, off),
+    do: {<<0x08, byte_size(b)::32-little, b::binary>>, off + 5 + byte_size(b)}
+
+  defp enc(s, refs, _opts, off) when is_binary(s) do
+    case refs do
+      %{^s => id} -> {<<0x0B, int_bytes(id)::binary>>, off + 1 + int_size(id)}
+      _ -> {<<0x07, byte_size(s)::32-little, s::binary>>, off + 5 + byte_size(s)}
+    end
+  end
+
+  defp enc(%TypedArray{element_type: t, values: vs}, _refs, _opts, off) do
+    {sel, sz} = Map.fetch!(@elem_types, t)
+    buf = IO.iodata_to_binary(Enum.map(vs, &enc_elem(&1, t)))
+    pad = align_pad(off + 7, sz)
+    {[<<0x0C, sel, length(vs)::32-little, pad>>, :binary.copy(<<0>>, pad), buf], off + 7 + pad + byte_size(buf)}
+  end
+
+  defp enc(%ObjectTable{columns: cols}, refs, opts, off) do
+    cols = Enum.sort_by(cols, &elem(&1, 0))
+    rowcount = cols |> hd() |> elem(2) |> length()
+
+    {cols_iodata, _off2} =
+      Enum.map_reduce(cols, off + 9, fn {name, t, vs}, o ->
+        {name_iodata, o1} = enc(name, refs, opts, o)
+        {sel, sz} = Map.fetch!(@elem_types, t)
+        buf = IO.iodata_to_binary(Enum.map(vs, &enc_elem(&1, t)))
+        pad = align_pad(o1 + 2, sz)
+        {[name_iodata, <<sel, pad>>, :binary.copy(<<0>>, pad), buf], o1 + 2 + pad + byte_size(buf)}
+      end)
+
+    {[<<0x0D, rowcount::32-little, length(cols)::32-little>>, cols_iodata],
+     off + 9 + IO.iodata_length(cols_iodata)}
+  end
+
+  defp enc(list, refs, opts, off) when is_list(list) do
+    if Keyword.get(opts, :typed_arrays, true) and homogeneous_numeric?(list) do
+      t = pick_elem_type(list)
+      {sel, sz} = Map.fetch!(@elem_types, t)
+      buf = IO.iodata_to_binary(Enum.map(list, &enc_elem(&1, t)))
+      pad = align_pad(off + 7, sz)
+      {[<<0x0C, sel, length(list)::32-little, pad>>, :binary.copy(<<0>>, pad), buf], off + 7 + pad + byte_size(buf)}
+    else
+      {items, off2} = Enum.map_reduce(list, off + 5, &enc(&1, refs, opts, &2))
+      {[<<0x09, length(list)::32-little>>, items], off2}
+    end
+  end
+
+  defp enc(map, refs, opts, off) when is_map(map) do
+    {pairs, off2} =
+      map
+      |> Enum.sort()
+      |> Enum.map_reduce(off + 5, fn {k, v}, o ->
+        {ke, o1} = enc(k, refs, opts, o)
+        {ve, o2} = enc(v, refs, opts, o1)
+        {[ke, ve], o2}
+      end)
+
+    {[<<0x0A, map_size(map)::32-little>>, pairs], off2}
+  end
+
+  defp enc_schema_body(data, schema, refs, id16?, base) do
+    id = if id16?, do: <<schema.id::size(16)-little>>, else: <<schema.id::size(32)-little>>
+
+    {vals, off} =
+      Enum.map_reduce(schema.fields, base + byte_size(id), fn {name, t}, o ->
+        enc_field(Map.fetch!(data, name), t, refs, o)
+      end)
+
+    {[id, vals], off}
+  end
+
+  defp enc_field(v, t, _refs, off) when t in [:int8, :int16, :int32, :int64] do
+    {_, sz} = Map.fetch!(@elem_types, t)
+    {<<v::signed-little-size(sz * 8)>>, off + sz}
+  end
+
+  defp enc_field(v, t, _refs, off) when t in [:uint8, :uint16, :uint32, :uint64] do
+    {_, sz} = Map.fetch!(@elem_types, t)
+    {<<v::unsigned-little-size(sz * 8)>>, off + sz}
+  end
+
+  defp enc_field(v, :float32, _refs, off), do: {<<v::float-little-size(32)>>, off + 4}
+  defp enc_field(v, :float64, _refs, off), do: {<<v::float-little-size(64)>>, off + 8}
+  defp enc_field(nil, :null, _refs, off), do: {"", off}
+  defp enc_field(v, :bool, _refs, off), do: {<<(if v, do: 1, else: 0)>>, off + 1}
+
+  defp enc_field(v, :binary, refs, off) when is_binary(v), do: enc(%Raw{bytes: v}, refs, [], off)
+  defp enc_field(v, _t, refs, off), do: enc(v, refs, [], off)
+
+  defp schema_block(schema, id16?) do
+    id = if id16?, do: <<schema.id::size(16)-little>>, else: <<schema.id::size(32)-little>>
+
+    fields =
+      Enum.map(schema.fields, fn {name, t} ->
+        {sel, _sz} = Map.fetch!(@elem_types, t)
+        [<<byte_size(name)::32-little>>, name, <<sel>>]
+      end)
+
+    [id, <<byte_size(schema.name)::32-little>>, schema.name, <<length(schema.fields)::32-little>>, fields]
+  end
+
+  defp collect(nil), do: []
+  defp collect(v) when is_integer(v) or is_float(v) or is_boolean(v), do: []
+  defp collect(%Raw{}), do: []
+  defp collect(%TypedArray{}), do: []
+
+  defp collect(%ObjectTable{columns: cols}),
+    do: Enum.flat_map(cols, fn {name, _t, _vs} -> collect(name) end)
+
+  defp collect(s) when is_binary(s), do: [s]
+  defp collect(list) when is_list(list), do: Enum.flat_map(list, &collect/1)
+
+  defp collect(map) when is_map(map) do
+    map
+    |> Enum.sort()
+    |> Enum.flat_map(fn {k, v} -> collect(k) ++ collect(v) end)
+  end
+
+  ## ── Encode helpers ──────────────────────────────────────────────────────
+
+  defp homogeneous_numeric?(list),
+    do: list != [] and (Enum.all?(list, &is_integer/1) or Enum.all?(list, &is_float/1))
+
+  defp pick_elem_type(values) do
+    if Enum.all?(values, &is_float/1) do
+      if Enum.all?(values, &float32_lossless?/1), do: :float32, else: :float64
+    else
+      min = Enum.min(values)
+      max = Enum.max(values)
+      Enum.find(@int_order, &fits?(min, max, &1))
+    end
+  end
+
+  # Signed-first, matching the §26.4 vector: when a signed and an unsigned type
+  # of the same width both fit, the signed type is used.
+  defp fits?(min, max, :int8), do: min >= -128 and max <= 127
+  defp fits?(min, max, :uint8), do: min >= 0 and max <= 255
+  defp fits?(min, max, :int16), do: min >= -32_768 and max <= 32_767
+  defp fits?(min, max, :uint16), do: min >= 0 and max <= 65_535
+  defp fits?(min, max, :int32), do: min >= -2_147_483_648 and max <= 2_147_483_647
+  defp fits?(min, max, :uint32), do: min >= 0 and max <= 4_294_967_295
+  defp fits?(_min, _max, :int64), do: true
+  defp fits?(min, _max, :uint64), do: min >= 0
+
+  defp enc_elem(v, t) do
+    {_, sz} = Map.fetch!(@elem_types, t)
+
+    cond do
+      t in [:float32, :float64] -> <<v::float-little-size(sz * 8)>>
+      t in [:int8, :int16, :int32, :int64] -> <<v::signed-little-size(sz * 8)>>
+      true -> <<v::unsigned-little-size(sz * 8)>>
+    end
+  end
+
+  defp float32_lossless?(f) do
+    <<g::float-little-size(32)>> = <<f::float-little-size(32)>>
+    g == f
+  end
+
+  defp align_pad(target_off, elem_size), do: rem(elem_size - rem(target_off, elem_size), elem_size)
+
+  defp int_bytes(id) when id in -32..95, do: <<id + 64>>
+  defp int_bytes(id) when id in -2_147_483_648..2_147_483_647, do: <<id::signed-little-size(32)>>
+  defp int_bytes(id), do: <<id::signed-little-size(64)>>
+
+  defp int_size(id) when id in -32..95, do: 1
+  defp int_size(id) when id in -2_147_483_648..2_147_483_647, do: 4
+  defp int_size(_id), do: 8
+
+  ## ── Decode ──────────────────────────────────────────────────────────────
+
+  def decode(bin, _opts \\ []) do
+    do_decode(bin)
+  rescue
+    e in [MatchError, ArgumentError, FunctionClauseError] -> {:error, Exception.message(e)}
+  end
+
+  def decode!(bin, opts \\ []) do
+    {:ok, value} = decode(bin, opts)
+    value
+  end
+
+  defp do_decode(<<@magic, 1, flags, 0, 0, rest::binary>>) do
+    {strings, off, rest} = parse_table(rest, flags, 8)
+    refs = strings |> Enum.with_index() |> Map.new(fn {s, i} -> {i, s} end)
+    {schema, _id16?, off, rest} = parse_schema_block(rest, flags, off)
+
+    {value, _off, rest} =
+      if (flags &&& 0x02) != 0 do
+        decode_schema_body(rest, flags, off, schema, refs)
+      else
+        parse_value(rest, off, refs)
+      end
+
+    case rest do
+      <<>> -> {:ok, value}
+      _ -> {:error, :trailing_bytes}
+    end
+  end
+
+  defp do_decode(_), do: {:error, :bad_header}
+
+  defp parse_table(rest, flags, off) do
+    if (flags &&& 0x04) != 0 do
+      {count, rest} = u32(rest)
+      {strings, consumed, rest} = parse_strings(rest, count, 4, [])
+      pad = pad_len(consumed)
+      {_pad_bytes, rest} = skip_pad(rest, pad)
+      {strings, off + consumed + pad, rest}
+    else
+      {[], off, rest}
+    end
+  end
+
+  defp parse_strings(rest, 0, consumed, acc), do: {:lists.reverse(acc), consumed, rest}
+
+  defp parse_strings(rest, n, consumed, acc) do
+    {len, rest} = u32(rest)
+    <<s::size(^len)-binary, rest::binary>> = rest
+    parse_strings(rest, n - 1, consumed + 4 + len, [s | acc])
+  end
+
+  defp parse_schema_block(rest, flags, off) do
+    if (flags &&& 0x02) != 0 do
+      id16? = (flags &&& 0x20) != 0
+      idsz = if id16?, do: 2, else: 4
+      {id, rest} = if id16?, do: u16(rest), else: u32(rest)
+      {name_len, rest} = u32(rest)
+      <<name::size(^name_len)-binary, rest::binary>> = rest
+      {nfields, rest} = u32(rest)
+      {fields, fields_sz, rest} = parse_fields(rest, nfields, 0, [])
+      consumed = idsz + 4 + name_len + 4 + fields_sz
+      pad = pad_len(consumed)
+      {_pad_bytes, rest} = skip_pad(rest, pad)
+      schema = %{id: id, name: name, fields: fields}
+      {schema, id16?, off + consumed + pad, rest}
+    else
+      {nil, false, off, rest}
+    end
+  end
+
+  defp parse_fields(rest, 0, sz, acc), do: {Enum.reverse(acc), sz, rest}
+
+  defp parse_fields(rest, n, sz, acc) do
+    {len, rest} = u32(rest)
+    <<fname::size(^len)-binary, sel, rest::binary>> = rest
+    parse_fields(rest, n - 1, sz + 4 + len + 1, [{fname, sel_to_type!(sel)} | acc])
+  end
+
+  defp decode_schema_body(rest, flags, off, schema, refs) do
+    id16? = (flags &&& 0x20) != 0
+    idsz = if id16?, do: 2, else: 4
+    {body_id, rest} = if id16?, do: u16(rest), else: u32(rest)
+    true = body_id == schema.id
+    decode_fields(rest, off + idsz, refs, schema.fields, %{})
+  end
+
+  defp decode_fields(rest, off, _refs, [], acc), do: {acc, off, rest}
+
+  defp decode_fields(rest, off, refs, [{name, t} | tf], acc) do
+    {v, off, rest} = decode_field(rest, off, refs, t)
+    decode_fields(rest, off, refs, tf, Map.put(acc, name, v))
+  end
+
+  defp decode_field(rest, off, _refs, t) when t in [:int8, :int16, :int32, :int64] do
+    {_, sz} = Map.fetch!(@elem_types, t)
+    <<v::signed-little-size(^sz * 8), rest::binary>> = rest
+    {v, off + sz, rest}
+  end
+
+  defp decode_field(rest, off, _refs, t) when t in [:uint8, :uint16, :uint32, :uint64] do
+    {_, sz} = Map.fetch!(@elem_types, t)
+    <<v::unsigned-little-size(^sz * 8), rest::binary>> = rest
+    {v, off + sz, rest}
+  end
+
+  defp decode_field(<<v::float-little-size(32), rest::binary>>, off, _refs, :float32),
+    do: {v, off + 4, rest}
+
+  defp decode_field(<<v::float-little-size(64), rest::binary>>, off, _refs, :float64),
+    do: {v, off + 8, rest}
+
+  defp decode_field(rest, off, _refs, :null), do: {nil, off, rest}
+  defp decode_field(<<x, rest::binary>>, off, _refs, :bool), do: {x == 1, off + 1, rest}
+
+  defp decode_field(rest, off, _refs, :binary) do
+    {%Raw{bytes: b}, off, rest} = parse_value(rest, off, %{})
+    {b, off, rest}
+  end
+
+  defp decode_field(rest, off, refs, t) when t in [:string, :array, :object],
+    do: parse_value(rest, off, refs)
+
+  defp parse_value(<<tag, rest::binary>>, off, refs) do
+    case tag do
+      0x00 -> {nil, off + 1, rest}
+      0x01 -> {false, off + 1, rest}
+      0x02 -> {true, off + 1, rest}
+      t when t in 0x20..0x9F -> {t - 64, off + 1, rest}
+
+      0x03 ->
+        <<n::signed-little-size(32), rest::binary>> = rest
+        {n, off + 5, rest}
+
+      0x04 ->
+        <<n::signed-little-size(64), rest::binary>> = rest
+        {n, off + 9, rest}
+
+      0x05 ->
+        <<v::float-little-size(32), rest::binary>> = rest
+        {v, off + 5, rest}
+
+      0x06 ->
+        <<v::float-little-size(64), rest::binary>> = rest
+        {v, off + 9, rest}
+
+      0x07 ->
+        {len, rest} = u32(rest)
+        <<s::size(^len)-binary, rest::binary>> = rest
+        {s, off + 5 + len, rest}
+
+      0x08 ->
+        {len, rest} = u32(rest)
+        <<b::size(^len)-binary, rest::binary>> = rest
+        {%Raw{bytes: b}, off + 5 + len, rest}
+
+      0x09 ->
+        {count, rest} = u32(rest)
+        parse_items(rest, off + 5, refs, count, [])
+
+      0x0A ->
+        {count, rest} = u32(rest)
+        {pairs, off2, rest2} = parse_pairs(rest, off + 5, refs, count, [])
+        {Map.new(pairs), off2, rest2}
+
+      0x0B ->
+        {id, rest} = parse_int(rest)
+        {Map.fetch!(refs, id), off + 1 + int_size(id), rest}
+
+      0x0C ->
+        <<sel, count::32-little, padlen, rest::binary>> = rest
+        t = sel_to_type!(sel)
+        true = t in [:int8, :uint8, :int16, :uint16, :int32, :uint32, :int64, :uint64, :float32, :float64]
+        {_, sz} = Map.fetch!(@elem_types, t)
+        true = padlen == align_pad(off + 7, sz)
+        {_pad_bytes, rest} = skip_pad(rest, padlen)
+        buflen = count * sz
+        <<buf::size(^buflen)-binary, rest::binary>> = rest
+
+        {%TypedArray{element_type: t, values: decode_elems(buf, t, sz)},
+         off + 7 + padlen + buflen, rest}
+
+      0x0D ->
+        {rows, rest} = u32(rest)
+        {ncols, rest} = u32(rest)
+        {cols, off2, rest2} = parse_columns(rest, off + 9, refs, ncols, rows, [])
+        {%ObjectTable{columns: cols}, off2, rest2}
+
+      tag ->
+        raise ArgumentError, "unknown tag #{inspect(tag, base: :hex)} at offset #{off}"
+    end
+  end
+
+  defp parse_items(rest, off, _refs, 0, acc), do: {:lists.reverse(acc), off, rest}
+
+  defp parse_items(rest, off, refs, n, acc) do
+    {v, off, rest} = parse_value(rest, off, refs)
+    parse_items(rest, off, refs, n - 1, [v | acc])
+  end
+
+  defp parse_pairs(rest, off, _refs, 0, acc), do: {:lists.reverse(acc), off, rest}
+
+  defp parse_pairs(rest, off, refs, n, acc) do
+    {k, off, rest} = parse_value(rest, off, refs)
+    {v, off, rest} = parse_value(rest, off, refs)
+    parse_pairs(rest, off, refs, n - 1, [{k, v} | acc])
+  end
+
+  defp parse_columns(rest, off, _refs, 0, _rows, acc), do: {:lists.reverse(acc), off, rest}
+
+  defp parse_columns(rest, off, refs, n, rows, acc) do
+    {name, off, rest} = parse_value(rest, off, refs)
+    <<sel, padlen, rest::binary>> = rest
+    t = sel_to_type!(sel)
+    {_, sz} = Map.fetch!(@elem_types, t)
+    true = padlen == align_pad(off + 2, sz)
+    {_pad_bytes, rest} = skip_pad(rest, padlen)
+    buflen = rows * sz
+    <<buf::size(^buflen)-binary, rest::binary>> = rest
+    parse_columns(rest, off + 2 + padlen + buflen, refs, n - 1, rows, [{name, t, decode_elems(buf, t, sz)} | acc])
+  end
+
+  defp parse_int(<<b, rest::binary>>) when b in 0x20..0x9F, do: {b - 64, rest}
+  defp parse_int(<<0x03, n::signed-little-size(32), rest::binary>>), do: {n, rest}
+  defp parse_int(<<0x04, n::signed-little-size(64), rest::binary>>), do: {n, rest}
+
+  defp decode_elems(buf, t, sz) do
+    for <<chunk::size(^sz)-binary <- buf>> do
+      cond do
+        t in [:float32, :float64] ->
+          <<v::float-little-size(^sz * 8)>> = chunk
+          v
+
+        t in [:int8, :int16, :int32, :int64] ->
+          <<v::signed-little-size(^sz * 8)>> = chunk
+          v
+
+        true ->
+          <<v::unsigned-little-size(^sz * 8)>> = chunk
+          v
+      end
+    end
+  end
+
+  defp u16(<<n::size(16)-little, rest::binary>>), do: {n, rest}
+  defp u32(<<n::size(32)-little, rest::binary>>), do: {n, rest}
+
+  defp pad_len(consumed), do: rem(8 - rem(consumed, 8), 8)
+
+  defp skip_pad(rest, 0), do: {"", rest}
+
+  defp skip_pad(rest, padlen) do
+    n = padlen
+    <<pad::size(^n)-binary, rest2::binary>> = rest
+    true = pad == :binary.copy(<<0>>, n)
+    {pad, rest2}
+  end
+
+  defp sel_to_type!(sel) do
+    case Map.fetch(@sel_to_type, sel) do
+      {:ok, t} -> t
+      :error -> raise ArgumentError, "invalid element type selector #{inspect(sel, base: :hex)}"
+    end
+  end
+
+  ## ── Utilities ───────────────────────────────────────────────────────────
+
+  def to_rows(%ObjectTable{columns: []}), do: []
+
+  def to_rows(%ObjectTable{columns: cols}) do
+    names = Enum.map(cols, &elem(&1, 0))
+    vals = Enum.map(cols, &elem(&1, 2))
+
+    for i <- 0..(vals |> hd() |> length()) - 1 do
+      names |> Enum.zip(Enum.map(vals, &Enum.at(&1, i))) |> Map.new()
+    end
+  end
+
+  def hexdump(bin) when is_binary(bin) do
+    bin
+    |> :binary.bin_to_list()
+    |> Enum.chunk_every(16, 16, [])
+    |> Enum.with_index()
+    |> Enum.map_join("\n", fn {chunk, i} ->
+      hex =
+        chunk
+        |> Enum.map_join(" ", &:io_lib.format("~2.16.0B", [&1]) |> IO.iodata_to_binary())
+        |> String.pad_trailing(16 * 3 - 1)
+
+      ascii =
+        chunk
+        |> Enum.map(fn b -> if b in 32..126, do: <<b>>, else: "." end)
+        |> Enum.join()
+
+      :io_lib.format("~4.16.0B  ~s  ~s", [i * 16, hex, ascii]) |> IO.iodata_to_binary()
+    end)
+  end
+end
+```
+
+## 2. Envelope, tags, and SmallInt (§7–§8)
+
+Every message starts with the 8-byte header `42 54 4F 4E` ("BTON") + version +
+flags + reserved. Every value starts with a one-byte tag — except integers in
+−32..95, which are the tag *and* the value in a single byte:
+
+```elixir
+alias BTOON.Example.{Raw, TypedArray, ObjectTable}
+import BTOON.Example
+
+IO.puts("42  →  " <> hexdump(encode(42)))
+IO.puts("")
+IO.puts("96  →  " <> hexdump(encode(96)))
+IO.puts("")
+IO.puts("1.5 →  " <> hexdump(encode(1.5)))
+```
+
+* `42` encodes as bare `6A` (SmallInt: `42 + 64 = 0x6A`) — one read, one branch.
+* `96` just misses SmallInt, so it becomes tag `03` + Int32.
+* `1.5` survives a binary32 round-trip exactly, so the encoder MUST use Float32
+  (determinism, §17).
+
+## 3. Byte-for-byte spec vectors (§26)
+
+The spec's test vectors are executable. Each assertion compares the encoded
+bytes against the exact hex from §26.1–§26.6:
+
+```elixir
+vectors = [
+  {nil,                  "42544F4E0100000000"},
+  {false,                "42544F4E0100000001"},
+  {true,                 "42544F4E0100000002"},
+  {-32,                  "42544F4E0100000020"},
+  {0,                    "42544F4E0100000040"},
+  {42,                   "42544F4E010000006A"},
+  {95,                   "42544F4E010000009F"},
+  {96,                   "42544F4E010000000360000000"},
+  {-33,                  "42544F4E0100000003DFFFFFFF"},
+  {2_147_483_648,        "42544F4E01000000040000008000000000"},
+  {1.5,                  "42544F4E01000000050000C03F"},
+  {1.1,                  "42544F4E01000000069A9999999999F13F"},
+  {%Raw{bytes: <<1, 2, 3>>}, "42544F4E010000000803000000010203"}
+]
+
+Enum.each(vectors, fn {value, expected} ->
+  got = encode(value) |> Base.encode16()
+  true = got == expected
+  # every vector must also decode back to the original value
+  true = decode!(encode(value)) == value
+  IO.puts("✓ #{inspect(value)} → #{got}")
+end)
+```
+
+Note the SmallInt boundaries (§26.2): −32, −1, 0, 95 use SmallInt; `96` and
+`−33` MUST NOT.
+
+## 4. String table & objects (§10–§11)
+
+Strings are the biggest source of waste in real payloads, so the encoder
+collects them in first-encounter order into a per-message table, zero-pads the
+table to a multiple of 8, and references them by integer id:
+
+```elixir
+encode(%{"age" => 30, "name" => "Alice"}) |> hexdump() |> IO.puts()
+```
+
+Reading the bytes: table flag `04`, three entries (`"age"`, `"name"`,
+`"Alice"` — keys first, in sorted order, values after), padding `00 00 00 00`,
+then the object `0A` with StringRef keys and SmallInt/StringRef values.
+Decoders keep the refs lazy and only stringify on access.
+
+## 5. TypedArray and alignment (§13, §16)
+
+A homogeneous numeric array MUST become a TypedArray: element type + count +
+padding + raw little-endian buffer, decoded in bulk with no per-element tags.
+The padding is what makes zero-copy views possible — the buffer must start at
+an address aligned to its element size:
+
+```elixir
+encode(%{"score" => 1, "pos" => [1.0, 2.0]}) |> hexdump() |> IO.puts()
+```
+
+Walk the offsets: body at 32, object header 5, key ref 2, TypedArray header
+7, then `PadLen` = 2 zero bytes — the Float32 buffer starts at offset 48:
+
+```elixir
+buf_offset = 8 + 24 + 5 + 2 + 7 + 2  # header + padded table + object hdr + key ref + TA hdr + pad
+rem(buf_offset, 4)  # must be 0 for a float32 view
+```
+
+The decoder validates the same equation and rejects non-zero padding, so a
+malicious or broken encoder cannot smuggle data in padding bytes.
+
+## 6. ObjectTable — column mode (§14)
+
+An array of objects with identical numeric fields becomes a columnar table:
+N column reads instead of N×M per-value parses. This is the highest-leverage
+path for "100 players" style workloads:
+
+```elixir
+table = %ObjectTable{
+  columns: [
+    {"x", :int8, [1, 3]},
+    {"y", :float32, [2.5, 4.5]}
+  ]
+}
+
+encoded = encode(table)
+IO.puts(hexdump(encoded))
+{:ok, decoded} = decode(encoded)
+to_rows(decoded)
+```
+
+The column names go through the string table as StringRefs, each column buffer
+is independently aligned to its element size, and `to_rows/1` reconstructs the
+original rows by striding across columns.
+
+## 7. Schema mode (§15, §26.6)
+
+When peers share a schema, the encoder omits keys and type tags entirely — the
+body is just `SchemaID` + ordered fixed-width values. The schema flag (`0x02`)
+signals the body mode, and the embedded schema is authoritative. This is the
+exact §26.6 vector:
+
+```elixir
+schema = %{
+  id: 100,
+  name: "Player",
+  fields: [{"id", :int32}, {"x", :float32}, {"y", :float32}, {"hp", :uint16}]
+}
+
+data = %{"id" => 1, "x" => 1.0, "y" => 2.5, "hp" => 100}
+
+encoded = encode(data, schema: schema)
+expected = "42544F4E010200006400000006000000506C617965720400000002000000696404010000007807010000007907020000006870030000000064000000010000000000803F000020406400"
+
+true = Base.encode16(encoded) == expected
+true = decode!(encoded) == data
+IO.puts("✓ schema vector matches §26.6 byte-for-byte")
+decoded = decode!(encoded)
+```
+
+No tags, no keys, no string table — the hot path is a struct-cast over the
+wire bytes. The 4-byte schema block padding (`00000000`) keeps the body
+8-byte aligned.
+
+Flag `0x20` shrinks the schema ID to UInt16. One subtlety the implementation
+surfaces: the block saving is **absorbed by the 8-byte padding** (44+4 pad vs.
+42+6 pad) — the real saving is the 2-byte `SchemaID` in the body:
+
+```elixir
+full = encode(data, schema: schema)
+short = encode(data, schema: schema, schema_id_uint16: true)
+"block: no change (padding absorbs it), body: 2 bytes saved, total #{byte_size(full) - byte_size(short)}"
+```
+
+## 8. Defensive decoding (§19, §24)
+
+The decoder rejects bad magic, unknown tags, trailing bytes, and validates
+every padding and ref:
+
+```elixir
+{:error, :bad_header} = decode("NOPE" <> encode(1))
+{:error, :trailing_bytes} = decode(encode(1) <> <<0>>)
+{:error, _} = decode(<<0xFF>>)
+
+:ok
+```
+
+Real implementations add configurable limits on nesting depth, string/binary
+size, and container counts — a length field can claim gigabytes.
+
+## 9. Scope and limitations
+
+This notebook is a **teaching implementation**, not a production codec:
+
+* no session dictionary — the negotiated dictionary from §11.1/§21.1 (flags
+  0x08/0x10) is the piece that makes repeated field names nearly free;
+* no extension types (§23) — the tag range `0xF0–0xFF` with the
+  `PayloadLength` prefix;
+* no change tracking (§20) — an application-level concern;
+* strings and binaries are ambiguous in Elixir — use `%Raw{}` for opaque
+  bytes, plain binaries for UTF-8 strings;
+* decode materializes TypedArrays as lists (the spec allows views where the
+  runtime supports zero-copy slices).
+
+For the TOON text side — examples, demos, and Phoenix Channels integration —
+see [`toon_ex`](https://hex.pm/packages/toon_ex) on Hex
+([docs](https://toon-ex.hexdocs.pm/)) and the spec at
+[toonformat.dev](https://toonformat.dev/).

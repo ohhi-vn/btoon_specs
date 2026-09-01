@@ -61,10 +61,14 @@ BTOON  → machine readable, high-performance transport
 It is used for WebSocket communication, Phoenix Channels, RPC, streaming, IoT,
 telemetry, multiplayer games, and distributed systems.
 
-The reference implementation is written in Elixir (`lib/btoon/` in this
-repository) and follows this specification exactly. Where this document and the
-implementation disagree, the implementation is authoritative until this document
-is updated.
+The BTOON text codec that defines the data model in practice is
+[`toon_ex`](https://hex.pm/packages/toon_ex), an Elixir BTOON encoder/decoder and
+BTOON ↔ TOON ↔ JSON converter with Phoenix Channels support ([docs](https://toon-ex.hexdocs.pm/)).
+Its examples are the recommended starting point for working with the
+TOON data model before choosing the BTOON binary transport. BTOON
+implementations follow this specification; where this document and an
+implementation disagree, this document is authoritative until the
+implementation is fixed or the document updated.
 
 ## 2. Design Goals
 
@@ -126,7 +130,7 @@ The data model mirrors TOON/JSON.
 | ------- | ---------------------------------------- |
 | Null    | `nil`                                    |
 | Boolean | `true` / `false`                         |
-| Integer | arbitrary precision, encoded int32/int64 |
+| Integer | 64-bit range, encoded int32/int64        |
 | Float   | IEEE-754, float32/float64                |
 | String  | UTF-8                                    |
 | Binary  | raw bytes (distinct from String)         |
@@ -269,16 +273,26 @@ Present only when flag bit 1 (`0x02`) is set. Layout:
 
 See [§15](#15-schema-mode) for the body layout that follows.
 
+The schema block is zero-padded at its end to a multiple of 8 bytes, so the
+body that follows remains 8-byte aligned ([§16](#16-alignment-and-padding)) —
+including when no string table precedes it.
+
 ### 7.6.1 Schema ID Size (Flag 0x20)
 
 When flag bit 5 (`0x20`) is set, the embedded schema's `SchemaID` field is encoded as **UInt16** (2 bytes) instead of UInt32 (4 bytes). This saves 2 bytes per message for deployments with fewer than 65,536 schemas.
 
 The schema ID size flag (0x20) only affects the embedded schema block in the envelope; the schema-mode body (which begins with `SchemaID`) always uses the size matching this flag.
 
+Note: because the schema block is zero-padded to a multiple of 8
+([§7.6](#76-embedded-schema)), the UInt16 ID does not shrink the block itself —
+the padding absorbs it. The net saving is the 2-byte `SchemaID` in the body.
+
 ### 7.7 Body
 
-The body begins 8-byte aligned. It is either a single tagged value (dynamic
-mode) or a schema body ([§15](#15-schema-mode)).
+The body begins 8-byte aligned. It is a schema body ([§15](#15-schema-mode)) if
+and only if the schema flag (0x02) is set; otherwise it is a single tagged value
+(dynamic mode). A schema-mode message therefore always embeds its schema in v1
+(see [§21.2](#212-schema-negotiation)).
 
 ## 8. Value Encoding
 
@@ -304,6 +318,7 @@ entirely within the lead byte.
 | `0x0C`   | TypedArray    | element type + count + buffer |
 | `0x0D`   | ObjectTable   | row count + columns         |
 | `0x0E–0x1F` | reserved   | for future explicit tags    |
+| `0xF0–0xFF` | Extension  | registered types ([§23](#23-extension-types)) |
 
 There are no explicit Int8/Int16 tags. Small values use SmallInt
 ([§8.2](#82-smallint)); larger integers use Int32/Int64. This shrinks the
@@ -339,7 +354,8 @@ Dispatch is one range check on the lead byte:
 ```
 0x00–0x1F  → explicit tag (§8.1)
 0x20–0x9F  → SmallInt, value = byte − 64
-0xA0–0xFF  → reserved
+0xA0–0xEF  → reserved
+0xF0–0xFF  → extension type (§23)
 ```
 
 ## 9. Primitive Types
@@ -493,8 +509,8 @@ and Schema fields.
 | `0x0E`   | object  | var  | schema fields only        |
 | `0x0F`   | uint64  | 8    |                           |
 
-TypedArray buffers allow only the numeric types (`0x00–0x08`). ObjectTable
-columns allow only the numeric types (`0x00–0x08`, including `0x0F` uint64).
+TypedArray buffers allow only the numeric types (`0x00`–`0x08`). ObjectTable
+columns allow only the numeric types (`0x00`–`0x08` and `0x0F` uint64).
 Schema fields may use any selector.
 
 ## 13. Typed Arrays
@@ -537,7 +553,7 @@ Name (String|StringRef)  ElementType::1  PadLen::1  Padding  RawBuffer
 ```
 
 - `Name` is the field name as a String or StringRef.
-- **When the session dictionary flag (0x08) is set, column names MUST be encoded as StringRef.** This avoids repeating column names that are already in the session dictionary.
+- **When the session dictionary flag (0x08) is set, column names MUST be encoded as StringRef.** The ref MAY resolve to a session dictionary entry or to a per-message table entry; a name present in neither MUST be added to the per-message table — which means the no-table flag (0x10) MUST NOT be set in that case.
 - `RawBuffer` holds exactly `RowCount` elements of the column's element type,
   little-endian, aligned per [§16](#16-alignment-and-padding).
 - Column data is decoded in bulk; rows are reconstructed by striding across
@@ -560,9 +576,11 @@ an element type ([§12](#12-element-types)). The element types allowed in schema
 fields are the numeric types plus the composite selectors `null`, `bool`,
 `string`, `binary`, `array`, and `object`.
 
-The schema is either embedded in the envelope ([§7.6](#76-embedded-schema),
-schema flag set) or negotiated out of band and supplied by the application. When
-the schema flag is set, the embedded schema is authoritative.
+The schema is embedded in the envelope ([§7.6](#76-embedded-schema), schema
+flag set) and is authoritative. Schemas negotiated out of band
+([§21.2](#212-schema-negotiation)) MAY be supplied by the application to
+validate the embedded schema or to assist the dynamic path, but a schema-mode
+body always carries its schema on the wire in v1.
 
 ### 15.2 Body layout
 
@@ -586,8 +604,10 @@ and no keys:
 | array / object     | full tagged value ([§8](#8-value-encoding)) |
 
 Schema mode is the recommended default for any hot path (GPS, telemetry, game
-state, high-frequency channel traffic). It composes with [§16](#16-alignment-and-padding)
-so uniform schema payloads are also viewable as contiguous buffers.
+state, high-frequency channel traffic). Schema field values are packed with no
+intra-body padding; uniform fixed-width schemas (all fields the same width) are
+additionally viewable as contiguous buffers per
+[§16](#16-alignment-and-padding).
 
 The decoder reads values strictly according to the schema. A missing or
 wrong-typed value, or an integer outside a field's declared width, is an error.
@@ -603,9 +623,15 @@ loads).
 
 The rules:
 
+- Alignment is relative to the start of the message (the first byte of the
+  header). Applications are responsible for placing the message buffer at an
+  aligned address; all offsets within the message then satisfy the guarantees
+  below.
 - The header is exactly 8 bytes, so anything padded to a multiple of 8 after it
   stays 8-byte aligned.
 - The String Table MUST be zero-padded at its end to a multiple of 8 bytes.
+- The embedded Schema block MUST be zero-padded at its end to a multiple of 8
+  bytes (see [§7.6](#76-embedded-schema)).
 - Every TypedArray raw buffer MUST be preceded by `PadLen` (0–7) zero bytes so
   it begins aligned to its element size.
 - Every ObjectTable column raw buffer MUST be preceded by 0–7 zero bytes (via
@@ -623,11 +649,16 @@ Every input maps to exactly one byte sequence. The following rules are MUST:
 - Integers in −32..95 use SmallInt; outside that range the narrowest of
   Int32/Int64 is used. No other choice is legal.
 - Floats use Float32 only when lossless, else Float64.
-- Object keys are emitted in sorted order.
+- Object keys are emitted sorted by their UTF-8 byte sequence, comparing
+  StringRefs by the strings they resolve to.
 - Per-message string table entries are added in first-encounter order.
-- Homogeneous numeric arrays use the narrowest lossless element type.
-- Homogeneous object arrays use a columnar ObjectTable with columns in sorted
-  key order (when object tables are enabled).
+- Homogeneous numeric arrays use the narrowest lossless element type; when a
+  signed and an unsigned type of the same width both fit, the signed type is
+  used (matching [§26.4](#264-typedarray)).
+- Homogeneous object arrays whose fields are all numeric use a columnar
+  ObjectTable with columns sorted by the UTF-8 byte sequence of their keys
+  (when object tables are enabled); any other object array uses the general
+  Array encoding.
 - Little-endian byte order throughout.
 
 Two encoders MUST produce identical bytes for the same input; one encoder MUST
@@ -645,8 +676,8 @@ produce identical bytes across runs.
   ObjectTable for homogeneous object arrays (both MAY be disabled by
   application option, in which case the general Array encoding is used).
 - **Encoder MUST encode ObjectTable column names as StringRef when the session
-  dictionary flag (0x08) is set.** This avoids repeating column names already
-  present in the session dictionary.
+  dictionary flag (0x08) is set**, referencing the session dictionary or the
+  per-message table ([§14](#14-object-tables-column-mode)).
 - Encoder MUST set the envelope flags to match what it actually emitted
   (string table, schema, session dictionary, no per-message table, schema ID size).
 - **When the session dictionary flag (0x08) is set and the encoder will not emit
@@ -665,6 +696,9 @@ produce identical bytes across runs.
 - Decoder MUST reject truncated data, unknown tags, invalid element type
   selectors, StringRefs out of range, non-numeric ObjectTable columns, and
   schema values that violate the schema.
+- Decoder MUST reject trailing bytes after the body.
+- Decoder MUST reject a body that does not match the mode implied by flag 0x02
+  (a schema-mode body with flag unset, or a tagged body with flag set).
 - Decoder MUST impose configurable limits: maximum nesting depth, maximum
   string/binary size, and maximum container counts (see
   [§24](#24-security-considerations)).
@@ -720,22 +754,25 @@ After the handshake, no field names are transmitted; the encoder sets flag bit 3
 
 ### 21.2 Schema Negotiation
 
-Schemas may be embedded per message ([§7.6](#76-embedded-schema)), transmitted
-once and reused by id, or compiled into both endpoints. The reference
-implementation always embeds the schema on schema-mode messages and also accepts
-an out-of-band schema through decode options.
+Schemas may be transmitted once and reused by id, or compiled into both
+endpoints. In v1, however, a schema-mode body always embeds its schema in the
+envelope ([§7.6](#76-embedded-schema)) — the schema flag (0x02) is what signals
+the body mode ([§7.7](#77-body)). An out-of-band schema MAY still be supplied
+through decode options to validate the embedded schema or to name schemas
+across messages.
 
 ## 22. Versioning and Compatibility
 
 - The version byte identifies the wire format generation. Decoders MUST reject
   versions they do not support.
-- Reserved tag ranges (`0x0E–0x1F`, `0xA0–0xFF`) MAY be assigned by future
-  versions; decoders MUST treat unknown tags as errors, not as skippable data,
-  because skipping requires knowing each value's length.
+- Reserved tag ranges (`0x0E–0x1F`, `0xA0–0xEF`) MAY be assigned by future
+  versions; decoders MUST treat unknown tags outside the extension range as
+  errors, not as skippable data, because skipping requires knowing each value's
+  length.
 - Reserved flag bits MUST be ignored.
 - Extension types ([§23](#23-extension-types)) are the forward-compatible
-  escape hatch: unknown extension tags are registered, so a decoder that does
-  not know a specific extension can be told its length and skip it.
+  escape hatch: extension values are length-prefixed, so a decoder that does
+  not implement an extension MUST skip its payload rather than fail.
 - Future versions remain backward compatible at the decoder level: an older
   decoder MUST reject (never misparse) a newer version.
 
@@ -750,10 +787,18 @@ extension registry reserves the tag range `0xF0–0xFF`:
 | `0xF8–0xFB`  | Official (registered with the maintainers)  |
 | `0xFC–0xFF`  | Private / application-local                 |
 
-A registered extension defines its own payload layout and length encoding so
-decoders can skip it. Suggested candidate extensions: UUID, timestamp, decimal
-(Decimal128), GeoPoint, IPv6, and user-defined types. No extension tags are
-defined by this document.
+An extension value is encoded as:
+
+```
+Tag::1  PayloadLength::UInt32  Payload
+```
+
+`PayloadLength` counts only the payload bytes. Any decoder can therefore skip
+an unimplemented extension by reading the length and advancing; it MAY surface
+the raw payload to the application. The payload's internal layout is defined by
+the extension's registration. Suggested candidate extensions: UUID, timestamp,
+decimal (Decimal128), GeoPoint, IPv6, and user-defined types. No extension tags
+are defined by this document.
 
 ## 24. Security Considerations
 
@@ -761,7 +806,7 @@ Decoders MUST validate untrusted input defensively:
 
 - **Maximum packet size** — decoders SHOULD enforce a configurable limit.
 - **Maximum nesting depth** — decoders SHOULD enforce a configurable recursion
-  limit (the reference decoder defaults to 100).
+  limit (a default of 100 is recommended).
 - **Maximum string/binary size** — a length field can claim gigabytes; decoders
   MUST NOT allocate based on an untrusted length without a limit check.
 - **Maximum container counts** — array/object counts can claim enormous sizes;
@@ -798,7 +843,9 @@ one implementation MUST decode identically in every other implementation.
 ## 26. Test Vectors
 
 All examples are little-endian, shown as hex bytes. Envelope = `42 54 4F 4E` +
-version + flags + reserved.
+version + flags + reserved. An executable Elixir Livebook that implements a
+minimal codec and verifies every vector in this section lives in
+[btoon.livemd](btoon.livemd).
 
 ### 26.1 Primitives
 
@@ -877,9 +924,39 @@ with StringRef keys and values:
 0B 41 0B 42                        key "name" (ref 1), value "Alice" (ref 2)
 ```
 
+### 26.6 Schema mode
+
+Schema `100 "Player"` with fields `id int32`, `x float32`, `y float32`,
+`hp uint16`, body values `1, 1.0, 2.5, 100`:
+
+```
+42 54 4F 4E 01 02 00 00            header, flags = 0x02 (schema)
+64 00 00 00                        schema id = 100
+06 00 00 00 50 6C 61 79 65 72      "Player"
+04 00 00 00                        field count = 4
+02 00 00 00 69 64 04               "id", int32
+01 00 00 00 78 07                  "x", float32
+01 00 00 00 79 07                  "y", float32
+02 00 00 00 68 70 03               "hp", uint16
+00 00 00 00                        pad schema block (44 → 48)
+64 00 00 00                        SchemaID::UInt32 = 100
+01 00 00 00                        id = 1 (int32)
+00 00 80 3F                        x = 1.0 (float32)
+00 00 20 40                        y = 2.5 (float32)
+64 00                              hp = 100 (uint16)
+```
+
+The schema block is padded to a multiple of 8 so the body starts 8-byte
+aligned ([§7.6](#76-embedded-schema), [§16](#16-alignment-and-padding)). No
+per-message string table is present: schema bodies carry no keys.
+
 ## 27. Reference API
 
-The reference implementation (`BTOON` in this repository) exposes:
+A BTOON implementation SHOULD mirror the API conventions of the companion TOON
+text codec [`toon_ex`](https://hex.pm/packages/toon_ex)
+([docs](https://toon-ex.hexdocs.pm/)) — the same options and result shapes — so
+an application can switch between the text and binary encodings without
+changing call sites. The Elixir API shape is:
 
 ```elixir
 BTOON.encode!(data, opts)     # -> binary
@@ -968,7 +1045,11 @@ interop.
 Resolved in v0.3 / this revision: SmallInt (was ambiguous), endianness (fixed
 little-endian), compression (removed from scope, defer to transport-level
 permessage-deflate), TypedArray/ObjectTable dispatch (explicit tags), element
-type enum, and the exact padding mechanism.
+type enum, the exact padding mechanism, schema block padding (alignment hole
+when no string table precedes the schema), schema-mode body detection (flag
+0x02 signals the body mode; embedded schema is authoritative in v1), extension
+payload length prefix (makes unknown extensions skippable), the Int64 integer
+bound (§5 now agrees with §9.3), and sort order (UTF-8 byte sequence).
 
 ---
 
@@ -1045,11 +1126,14 @@ With a session dictionary `["player", "position", "velocity"]`, the message
 Schema `100 "Player"` with fields `id int32`, `x float32`, `y float32`,
 `hp uint16`:
 
-- Envelope flags: `0x02` (schema) | `0x04` (string table, when names/tables are
-  present).
-- Embedded schema block: id `100`, name `"Player"`, 4 fields.
+- Envelope flags: `0x02` (schema embedded; the schema flag also signals a
+  schema-mode body, [§7.7](#77-body)). No per-message string table is needed —
+  schema bodies carry no keys.
+- Embedded schema block: id `100`, name `"Player"`, 4 fields, padded to a
+  multiple of 8.
 - Body: `SchemaID::UInt32` = `100`, then `id::int32`, `x::float32`,
-  `y::float32`, `hp::uint16` — no tags, no keys.
+  `y::float32`, `hp::uint16` — no tags, no keys. See the exact bytes in
+  [§26.6](#266-schema-mode).
 
 ### B.3 ObjectTable
 
@@ -1062,5 +1146,7 @@ Rows `[{"x": 1, "y": 2.5}, {"x": 3, "y": 4.5}]`:
 
 ---
 
-*BTOON — Binary TOON. Version 1.0-draft. See also the reference implementation
-in `lib/btoon/` and the existing TOON text codec in `lib/toon_ex/`.*
+*BTOON — Binary TOON. Version 1.0-draft. The TOON text & BTOON codec companion are
+[`toon_ex`](https://hex.pm/packages/toon_ex) on Hex
+([docs](https://toon-ex.hexdocs.pm/)); TOON format background lives at
+[toonformat.dev](https://toonformat.dev/).*
